@@ -42,6 +42,7 @@
 #include <linux/sched/rt.h>
 #include <linux/debugfs.h>
 #include <linux/pm_opp.h>
+#include <linux/cpumask.h>
 
 #define CREATE_TRACE_POINTS
 #define TRACE_MSM_THERMAL
@@ -56,6 +57,8 @@
 
 #define POLLING_DELAY 100
 
+#define CPU_BUF_SIZE 64
+
 unsigned int temp_threshold = 60;
 module_param(temp_threshold, int, 0755);
 
@@ -63,6 +66,7 @@ static struct msm_thermal_data msm_thermal_info;
 static struct delayed_work check_temp_work;
 static bool core_control_enabled;
 static uint32_t cpus_offlined;
+static cpumask_var_t cpus_previously_online;
 static DEFINE_MUTEX(core_control_mutex);
 static struct kobject *cc_kobj;
 static struct kobject *mx_kobj;
@@ -411,6 +415,18 @@ static int devmgr_client_cpufreq_update(struct device_manager_data *dev_mgr)
 update_exit:
 	mutex_unlock(&dev_mgr->clnt_lock);
 	return ret;
+}
+
+static void cpus_previously_online_update(void)
+{
+	char buf[CPU_BUF_SIZE];
+
+	get_online_cpus();
+	cpumask_or(cpus_previously_online, cpus_previously_online,
+		   cpu_online_mask);
+	put_online_cpus();
+	cpulist_scnprintf(buf, sizeof(buf), cpus_previously_online);
+	pr_debug("%s\n", buf);
 }
 
 static int devmgr_client_hotplug_update(struct device_manager_data *dev_mgr)
@@ -909,7 +925,8 @@ static void update_cpu_topology(struct device *dev)
 static int __ref init_cluster_freq_table(void)
 {
 	uint32_t _cluster = 0, _cpu = 0, table_len = 0, idx = 0;
-	int ret = 0;
+	int ret = 0, cpu_set;
+	char buf[CPU_BUF_SIZE];
 	struct cluster_info *cluster_ptr = NULL;
 	struct cpufreq_policy *policy = NULL;
 	struct cpufreq_frequency_table *freq_table_ptr = NULL;
@@ -941,10 +958,22 @@ static int __ref init_cluster_freq_table(void)
 				cluster_ptr->cluster_id, _cpu);
 			pending_cpu_freq = _cpu;
 			if (!cpu_online(_cpu)) {
+				cpu_set = cpumask_test_cpu(_cpu,
+						cpus_previously_online);
 #ifdef CONFIG_SMP
 				cpu_up(_cpu);
 				cpu_down(_cpu);
 #endif
+				/* Remove prev online bit if we are first to
+				   put it online */
+				if (!cpu_set) {
+					cpumask_clear_cpu(_cpu,
+						cpus_previously_online);
+					cpumask_scnprintf(buf, sizeof(buf),
+						cpus_previously_online);
+					pr_debug("Reset prev online to %s\n",
+						 buf);
+				}
 			}
 			freq_table_ptr = pending_freq_table_ptr;
 		}
@@ -2149,13 +2178,15 @@ static void __ref do_core_control(long temp)
 				continue;
 			pr_info("Set Offline: CPU%d Temp: %ld\n",
 					i, temp);
-			trace_thermal_pre_core_offline(i);
-			ret = cpu_down(i);
-			if (ret)
-				pr_err("Error %d offline core %d\n",
-					ret, i);
-			trace_thermal_post_core_offline(i,
-				cpumask_test_cpu(i, cpu_online_mask));
+			if (cpu_online(i)) {
+				trace_thermal_pre_core_offline(i);
+				ret = cpu_down(i);
+				if (ret)
+					pr_err("Error %d offline core %d\n",
+					       ret, i);
+				trace_thermal_post_core_offline(i,
+					cpumask_test_cpu(i, cpu_online_mask));
+			}
 			cpus_offlined |= BIT(i);
 			break;
 		}
@@ -2173,6 +2204,10 @@ static void __ref do_core_control(long temp)
 			 * next offlined core.
 			 */
 			if (cpu_online(i))
+				continue;
+			/* If this core wasn't previously online don't put it
+			   online */
+			if (!(cpumask_test_cpu(i, cpus_previously_online)))
 				continue;
 			trace_thermal_pre_core_online(i);
 			ret = cpu_up(i);
@@ -2214,6 +2249,10 @@ static int __ref update_offline_cores(int val)
 				cpumask_test_cpu(cpu, cpu_online_mask));
 		} else if (online_core && (previous_cpus_offlined & BIT(cpu))) {
 			if (cpu_online(cpu))
+				continue;
+			/* If this core wasn't previously online don't put it
+			   online */
+			if (!(cpumask_test_cpu(cpu, cpus_previously_online)))
 				continue;
 			trace_thermal_pre_core_online(cpu);
 			ret = cpu_up(cpu);
@@ -2714,6 +2753,9 @@ static int __ref msm_thermal_cpu_callback(struct notifier_block *nfb,
 	uint32_t cpu = (uintptr_t)hcpu;
 
 	if (action == CPU_UP_PREPARE || action == CPU_UP_PREPARE_FROZEN) {
+		if (!cpumask_test_and_set_cpu(cpu, cpus_previously_online))
+			pr_debug("Total prev cores online tracked %u\n",
+				cpumask_weight(cpus_previously_online));
 		if (core_control_enabled &&
 			(msm_thermal_info.core_control_mask & BIT(cpu)) &&
 			(cpus_offlined & BIT(cpu))) {
@@ -2721,6 +2763,11 @@ static int __ref msm_thermal_cpu_callback(struct notifier_block *nfb,
 				cpu);
 			return NOTIFY_BAD;
 		}
+	} else if (action == CPU_DOWN_PREPARE ||
+				action == CPU_DOWN_PREPARE_FROZEN) {
+		if (!cpumask_test_and_set_cpu(cpu, cpus_previously_online))
+			pr_debug("Total prev cores online tracked %u\n",
+				cpumask_weight(cpus_previously_online));
 	}
 
 	pr_debug("voting for CPU%d to be online\n", cpu);
@@ -3909,6 +3956,7 @@ static ssize_t __ref store_cc_enabled(struct kobject *kobj,
 	core_control_enabled = !!val;
 	if (core_control_enabled) {
 		pr_info("Core control enabled\n");
+		cpus_previously_online_update();
 		register_cpu_notifier(&msm_thermal_cpu_notifier);
 		/*
 		 * Re-evaluate thermal core condition, update current status
@@ -4280,8 +4328,10 @@ int msm_thermal_init(struct msm_thermal_data *pdata)
 	INIT_DELAYED_WORK(&check_temp_work, check_temp);
 	schedule_delayed_work(&check_temp_work, 0);
 
-	if (num_possible_cpus() > 1)
+	if (num_possible_cpus() > 1) {
+		cpus_previously_online_update();
 		register_cpu_notifier(&msm_thermal_cpu_notifier);
+	}
 
 	return ret;
 }
