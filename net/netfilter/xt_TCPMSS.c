@@ -72,7 +72,7 @@ tcpmss_mangle_packet(struct sk_buff *skb,
 	tcph = (struct tcphdr *)(skb_network_header(skb) + tcphoff);
 	tcp_hdrlen = tcph->doff * 4;
 
-	if (len < tcp_hdrlen)
+	if (len < tcp_hdrlen || tcp_hdrlen < sizeof(struct tcphdr))
 		return -1;
 
 	if (info->mss == XT_TCPMSS_CLAMP_PMTU) {
@@ -122,7 +122,7 @@ tcpmss_mangle_packet(struct sk_buff *skb,
 		return 0;
 
 	/* tcph->doff has 4 bits, do not wrap it to 0 */
-	if (tcph->doff >= 15)
+	if (tcp_hdrlen >= 15 * 4)
 		return 0;
 
 	/*
