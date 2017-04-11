@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2014, 2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2014, 2016, 2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -621,6 +621,12 @@ int apr_deregister(void *handle)
 
 	if (!handle)
 		return -EINVAL;
+
+	if (!svc->svc_cnt) {
+		pr_err("%s: svc already deregistered. svc = %pK\n",
+			__func__, svc);
+		return -EINVAL;
+	}
 
 	mutex_lock(&svc->m_lock);
 	dest_id = svc->dest_id;
