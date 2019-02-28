@@ -52,7 +52,9 @@ MODULE_LICENSE("GPLv2");
 #define DT2W_TIME           	600
 
 /* Resources */
+int dt2w_master = -1;
 int dt2w_switch = DT2W_DEFAULT;
+int dt2w_switch_prev = DT2W_DEFAULT;
 bool dt2w_scr_suspended = false;
 bool in_phone_call = false;
 static cputime64_t tap_time_pre = 0;
@@ -64,18 +66,42 @@ static DEFINE_MUTEX(pwrkeyworklock);
 static struct workqueue_struct *dt2w_input_wq;
 static struct work_struct dt2w_input_work;
 
+/* Set dt2w state */
+void set_dt2w_master(int state)
+{
+	dt2w_master = state;
+
+	if ((dt2w_master == 1) && (dt2w_switch == 0)) {
+		dt2w_switch = (dt2w_switch_prev == 0) ? 2 : dt2w_switch_prev;
+	} else if (dt2w_master == 0) {
+		dt2w_switch_prev = dt2w_switch;
+		dt2w_switch = 0;
+	}
+}
+
+void set_dt2w_switch(int state)
+{
+	if ((dt2w_master == 1) && (state == 0))
+		return;
+
+	if ((dt2w_master == 0) && (state > 0))
+		return;
+
+	dt2w_switch = state;
+}
+
 /* Read cmdline for dt2w */
 static int __init read_dt2w_cmdline(char *dt2w)
 {
 	if (strcmp(dt2w, "1") == 0) {
 		pr_info("[cmdline_dt2w]: DoubleTap2Wake halscrren enabled. | dt2w='%s'\n", dt2w);
-		dt2w_switch = 1;
+		set_dt2w_switch(1);
 	} else if (strcmp(dt2w, "2") == 0) {
 		pr_info("[cmdline_dt2w]: DoubleTap2Wake fullscreen enabled. | dt2w='%s'\n", dt2w);
-		dt2w_switch = 2;
+		set_dt2w_switch(2);
 	} else if (strcmp(dt2w, "0") == 0) {
 		pr_info("[cmdline_dt2w]: DoubleTap2Wake disabled. | dt2w='%s'\n", dt2w);
-		dt2w_switch = 0;
+		set_dt2w_switch(0);
 	} else {
 		pr_info("[cmdline_dt2w]: No valid input found. Going with default: | dt2w='%u'\n", dt2w_switch);
 	}
@@ -276,6 +302,31 @@ static struct input_handler dt2w_input_handler = {
 /*
  * SYSFS stuff below here
  */
+static ssize_t dt2w_master_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	size_t count = 0;
+
+	count += sprintf(buf, "%d", dt2w_master);
+
+	return count;
+}
+
+static ssize_t dt2w_master_dump(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	if (strcmp(buf, "1") == 0) {
+		set_dt2w_master(1);
+	} else {
+		set_dt2w_master(0);
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR(doubletap2wake_master, (S_IWUSR|S_IRUGO),
+	dt2w_master_show, dt2w_master_dump);
+
 static ssize_t dt2w_doubletap2wake_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -291,7 +342,7 @@ static ssize_t dt2w_doubletap2wake_dump(struct device *dev,
 {
 	if (buf[0] >= '0' && buf[0] <= '2' && buf[1] == '\n')
                 if (dt2w_switch != buf[0] - '0')
-		        dt2w_switch = buf[0] - '0';
+		        set_dt2w_switch(buf[0] - '0');
 
 	return count;
 }
@@ -359,6 +410,10 @@ static int __init doubletap2wake_init(void)
 		pr_warn("%s: android_touch_kobj create_and_add failed\n", __func__);
 	}
 
+	rc = sysfs_create_file(android_touch_kobj, &dev_attr_doubletap2wake_master.attr);
+	if (rc) {
+		pr_warn("%s: sysfs_create_file failed for doubletap2wake_master\n", __func__);
+	}
 	rc = sysfs_create_file(android_touch_kobj, &dev_attr_doubletap2wake.attr);
 	if (rc) {
 		pr_warn("%s: sysfs_create_file failed for doubletap2wake\n", __func__);
